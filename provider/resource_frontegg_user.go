@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,6 +30,7 @@ type fronteggUser struct {
 	SkipInviteEmail bool               `json:"skipInviteEmail,omitempty"`
 	Verified        bool               `json:"verified,omitempty"`
 	SuperUser       bool               `json:"superUser,omitempty"`
+	Metadata        string             `json:"metadata,omitempty"`
 }
 
 const fronteggUserPath = "/identity/resources/users/v2"
@@ -87,19 +89,37 @@ func resourceFronteggUser() *schema.Resource {
 				Type:        schema.TypeBool,
 				Optional:    true,
 			},
+			"metadata": {
+				Description: "Metadata for this user. Overwrites the entire metadata field, since it's parsed as a single string in the API.",
+				Type:        schema.TypeMap,
+				Optional:    true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
 		},
 	}
 }
 
-func resourceFronteggUserSerialize(d *schema.ResourceData) fronteggUser {
+func resourceFronteggUserSerialize(d *schema.ResourceData) (*fronteggUser, error) {
 	log.Printf("role IDs: %#v", d.Get("role_ids").(*schema.Set).List())
-	return fronteggUser{
+	var metaStr string
+	if metadata, is_set := d.GetOk("metadata"); is_set {
+		if metaBytes, err := json.Marshal(metadata); err != nil {
+			return nil, fmt.Errorf("Error serializing user metadata to JSON: %s", err)
+		} else {
+			metaStr = string(metaBytes)
+		}
+	}
+
+	return &fronteggUser{
 		Email:           d.Get("email").(string),
 		Password:        d.Get("password").(string),
 		SkipInviteEmail: d.Get("skip_invite_email").(bool),
 		CreateRoleIDs:   d.Get("role_ids").(*schema.Set).List(),
 		SuperUser:       d.Get("superuser").(bool),
-	}
+		Metadata:        metaStr,
+	}, nil
 }
 
 func resourceFronteggUserDeserialize(d *schema.ResourceData, f fronteggUser) error {
@@ -114,16 +134,26 @@ func resourceFronteggUserDeserialize(d *schema.ResourceData, f fronteggUser) err
 	if err := d.Set("role_ids", roleIDs); err != nil {
 		return err
 	}
+	if len(f.Metadata) > 0 {
+		var metadataMap map[string]string
+		if err := json.Unmarshal([]byte(f.Metadata), &metadataMap); err != nil {
+			return err
+		}
+		d.Set("metadata", metadataMap)
+	}
 	return nil
 }
 
 func resourceFronteggUserCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	clientHolder := meta.(*restclient.ClientHolder)
-	in := resourceFronteggUserSerialize(d)
+	in, err := resourceFronteggUserSerialize(d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 	var out fronteggUser
 	headers := http.Header{}
 	headers.Add("frontegg-tenant-id", d.Get("tenant_id").(string))
-	if err := clientHolder.ApiClient.RequestWithHeaders(ctx, "POST", fronteggUserPath, headers, in, &out); err != nil {
+	if err := clientHolder.ApiClient.RequestWithHeaders(ctx, "POST", fronteggUserPath, headers, *in, &out); err != nil {
 		return diag.FromErr(err)
 	}
 
@@ -267,6 +297,26 @@ func resourceFronteggUserUpdate(ctx context.Context, d *schema.ResourceData, met
 		}
 
 		if err := d.Set("role_ids", news); err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	// Metadata:
+	if d.HasChange("metadata") {
+		headers := http.Header{}
+		headers.Add("frontegg-tenant-id", d.Get("tenant_id").(string))
+		headers.Add("frontegg-user-id", d.Id())
+		in, err := resourceFronteggUserSerialize(d)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		var out fronteggUser
+		if err := clientHolder.ApiClient.RequestWithHeaders(ctx, "PUT", fronteggUserPathV1, headers, struct {
+			Metadata string `json:"metadata"`
+		}{in.Metadata}, &out); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := resourceFronteggUserDeserialize(d, out); err != nil {
 			return diag.FromErr(err)
 		}
 	}
